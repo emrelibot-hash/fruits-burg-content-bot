@@ -1,11 +1,18 @@
 import os
 import time
-import secrets
+import json
 import requests
+from datetime import datetime, timezone
 from flask import Flask, request
+
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -13,11 +20,59 @@ if not BOT_TOKEN:
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 app = Flask(__name__)
 
-# In-memory sessions (MVP). Will be lost on redeploy — ok for now.
-# session[chat_id] = {"items": [{"type": "...", "file_id": "...", "text": "...", "ts": ...}], "last_draft": {...}}
 SESSIONS = {}
+_sheets_service = None
 
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
+
+# =========================
+# Google Sheets Integration
+# =========================
+
+def get_sheets_service():
+    global _sheets_service
+    if _sheets_service:
+        return _sheets_service
+
+    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+
+    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _sheets_service
+
+
+def append_approved_to_sheet(draft_id, materials_count, post_text):
+    service = get_sheets_service()
+    created_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    values = [[
+        draft_id,
+        "Approved",
+        created_utc,
+        materials_count,
+        post_text,
+        ""
+    ]]
+
+    service.spreadsheets().values().append(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range="Sheet1!A:F",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
+    ).execute()
+
+
+# =========================
+# Telegram Helpers
+# =========================
+
+def send_message(chat_id, text, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -25,163 +80,135 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
 
-def get_session(chat_id: int):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+
+
+def get_session(chat_id):
     if chat_id not in SESSIONS:
         SESSIONS[chat_id] = {"items": [], "last_draft": None}
     return SESSIONS[chat_id]
 
-def add_item(chat_id: int, item: dict):
-    sess = get_session(chat_id)
-    sess["items"].append(item)
 
 def make_draft_id():
-    # Simple sequential-ish ID, good enough for MVP
     return f"FB-{int(time.time())}"
 
-def build_draft_text(item_count: int):
-    # Placeholder draft generator (next step we will use OpenAI)
+
+def build_draft_text(item_count):
     return (
-        f"**Dried Persimmon Market Note**\n\n"
-        f"- Update based on {item_count} material(s)\n"
-        f"- Insight: demand planning matters most before Q4\n"
-        f"- Buyer takeaway: secure specs and volumes early\n\n"
-        f"Open to inquiries and supply planning discussions.\n\n"
+        f"Dried Persimmon Market Update\n\n"
+        f"- Based on {item_count} material(s)\n"
+        f"- Market insight: demand planning becomes critical before Q4\n"
+        f"- Buyers should secure specifications and volumes early\n\n"
+        f"Open for inquiries and supply discussions.\n\n"
         f"#driedfruit #persimmon #export #foodtrade #supplychain"
     )
 
-def draft_keyboard(draft_id: str):
+
+def draft_keyboard(draft_id):
     return {
         "inline_keyboard": [
-            [{"text": "✅ Approve", "callback_data": f"approve|{draft_id}"},
-             {"text": "✏ Edit", "callback_data": f"edit|{draft_id}"}],
-            [{"text": "♻ Rewrite", "callback_data": f"rewrite|{draft_id}"},
-             {"text": "❌ Reject", "callback_data": f"reject|{draft_id}"}],
+            [
+                {"text": "✅ Approve", "callback_data": f"approve|{draft_id}"},
+                {"text": "❌ Reject", "callback_data": f"reject|{draft_id}"}
+            ]
         ]
     }
+
+
+# =========================
+# Flask Routes
+# =========================
 
 @app.get("/")
 def health():
     return {"status": "running"}
 
+
 @app.post("/webhook")
 def webhook():
-    # Optional: secret-token gate
     if WEBHOOK_SECRET:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secret != WEBHOOK_SECRET:
             return {"error": "unauthorized"}, 403
 
-    data = request.get_json(silent=True) or {}
+    data = request.json
 
-    # Handle button callbacks
+    # Handle button clicks
     if "callback_query" in data:
         cq = data["callback_query"]
         chat_id = cq["message"]["chat"]["id"]
-        action, draft_id = (cq.get("data") or "").split("|", 1)
+        action, draft_id = cq["data"].split("|")
 
         sess = get_session(chat_id)
         last = sess.get("last_draft")
 
-        if not last or last.get("id") != draft_id:
-            send_message(chat_id, f"Draft {draft_id} not found in session (MVP). Generate again with /generate.")
+        if not last or last["id"] != draft_id:
+            send_message(chat_id, "Draft not found. Generate again with /generate.")
             return {"ok": True}
 
         if action == "approve":
-            send_message(chat_id, f"Approved ✅ Draft ID: {draft_id}\n\n(Next step: we’ll write this into Google Sheet.)")
-        elif action == "edit":
-            send_message(chat_id, f"Send your edits in one message.\nStart with:\n/edit {draft_id} <your changes>")
-        elif action == "rewrite":
-            # regenerate placeholder text
-            last["text"] = build_draft_text(item_count=len(sess["items"]))
-            send_message(chat_id, f"Rewritten ♻ Draft ID: {draft_id}\n\n{last['text']}", reply_markup=draft_keyboard(draft_id))
+            try:
+                append_approved_to_sheet(
+                    draft_id=draft_id,
+                    materials_count=len(sess["items"]),
+                    post_text=last["text"]
+                )
+                send_message(chat_id, f"Approved ✅ Draft ID: {draft_id}\nSaved to Google Sheet.")
+            except Exception as e:
+                send_message(chat_id, f"Approved but failed to save:\n{e}")
+
         elif action == "reject":
             send_message(chat_id, f"Rejected ❌ Draft ID: {draft_id}")
-            sess["last_draft"] = None
 
         return {"ok": True}
 
     # Handle messages
-    msg = data.get("message")
-    if not msg:
-        return {"ok": True}
+    if "message" in data:
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        text = msg.get("text", "")
 
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "")
-
-    # Commands
-    if text.startswith("/start"):
-        send_message(chat_id, "FruitsBurg Bot is live 🚀\n\nSend materials (text/photo/file), then /generate.")
-        return {"ok": True}
-
-    if text.startswith("/new"):
-        sess = get_session(chat_id)
-        sess["items"] = []
-        sess["last_draft"] = None
-        send_message(chat_id, "New draft session started ✅\nSend materials, then /generate.")
-        return {"ok": True}
-
-    if text.startswith("/status"):
-        sess = get_session(chat_id)
-        send_message(chat_id, f"Current session: {len(sess['items'])} material(s).")
-        return {"ok": True}
-
-    if text.startswith("/generate"):
-        sess = get_session(chat_id)
-        if not sess["items"]:
-            send_message(chat_id, "No materials yet. Send text/photo/file first.")
+        if text == "/start":
+            send_message(chat_id, "FruitsBurg Bot is live 🚀")
             return {"ok": True}
 
-        draft_id = make_draft_id()
-        draft_text = build_draft_text(item_count=len(sess["items"]))
-        sess["last_draft"] = {"id": draft_id, "text": draft_text}
-
-        send_message(chat_id, f"Draft ID: {draft_id}\n\n{draft_text}", reply_markup=draft_keyboard(draft_id))
-        return {"ok": True}
-
-    if text.startswith("/edit "):
-        # format: /edit <draft_id> <changes>
-        parts = text.split(" ", 2)
-        if len(parts) < 3:
-            send_message(chat_id, "Use: /edit <draft_id> <your changes>")
-            return {"ok": True}
-        _, draft_id, changes = parts
-        sess = get_session(chat_id)
-        last = sess.get("last_draft")
-        if not last or last.get("id") != draft_id:
-            send_message(chat_id, f"Draft {draft_id} not found. Use /generate again.")
+        if text == "/new":
+            sess = get_session(chat_id)
+            sess["items"] = []
+            sess["last_draft"] = None
+            send_message(chat_id, "New draft session started.")
             return {"ok": True}
 
-        # MVP: just append edits note
-        last["text"] = last["text"] + f"\n\nEdits requested:\n- {changes}"
-        send_message(chat_id, f"Updated ✏ Draft ID: {draft_id}\n\n{last['text']}", reply_markup=draft_keyboard(draft_id))
-        return {"ok": True}
+        if text == "/status":
+            sess = get_session(chat_id)
+            send_message(chat_id, f"Session materials: {len(sess['items'])}")
+            return {"ok": True}
 
-    # Collect materials
-    if msg.get("photo"):
-        # Take best quality photo (last item)
-        file_id = msg["photo"][-1]["file_id"]
-        add_item(chat_id, {"type": "photo", "file_id": file_id, "ts": time.time()})
-        sess = get_session(chat_id)
-        send_message(chat_id, f"Photo received. Session materials: {len(sess['items'])}. Send more or /generate.")
-        return {"ok": True}
+        if text == "/generate":
+            sess = get_session(chat_id)
+            if not sess["items"]:
+                send_message(chat_id, "No materials yet.")
+                return {"ok": True}
 
-    if msg.get("document"):
-        file_id = msg["document"]["file_id"]
-        filename = msg["document"].get("file_name", "file")
-        add_item(chat_id, {"type": "document", "file_id": file_id, "filename": filename, "ts": time.time()})
-        sess = get_session(chat_id)
-        send_message(chat_id, f"File received ({filename}). Session materials: {len(sess['items'])}. Send more or /generate.")
-        return {"ok": True}
+            draft_id = make_draft_id()
+            draft_text = build_draft_text(len(sess["items"]))
+            sess["last_draft"] = {"id": draft_id, "text": draft_text}
 
-    # Plain text material
-    if text:
-        add_item(chat_id, {"type": "text", "text": text, "ts": time.time()})
-        sess = get_session(chat_id)
-        send_message(chat_id, f"Note received. Session materials: {len(sess['items'])}. Send more or /generate.")
-        return {"ok": True}
+            send_message(chat_id, f"Draft ID: {draft_id}\n\n{draft_text}", draft_keyboard(draft_id))
+            return {"ok": True}
+
+        # Collect materials
+        if msg.get("photo"):
+            sess = get_session(chat_id)
+            sess["items"].append({"type": "photo"})
+            send_message(chat_id, f"Photo received. Session materials: {len(sess['items'])}")
+            return {"ok": True}
+
+        if text:
+            sess = get_session(chat_id)
+            sess["items"].append({"type": "text", "text": text})
+            send_message(chat_id, f"Note received. Session materials: {len(sess['items'])}")
+            return {"ok": True}
 
     return {"ok": True}
