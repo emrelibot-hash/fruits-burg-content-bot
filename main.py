@@ -9,7 +9,9 @@ from typing import Optional, Dict, Any, List
 import requests
 from flask import Flask, request
 
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -21,37 +23,42 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # Sheets only
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")            # Parent folder in YOUR Drive
+
+# OAuth (Drive only)
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-
 if not GOOGLE_SHEET_ID:
     raise RuntimeError("Missing GOOGLE_SHEET_ID")
-
 if not GOOGLE_SERVICE_ACCOUNT_JSON:
     raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
-
 if not GOOGLE_DRIVE_FOLDER_ID:
     raise RuntimeError("Missing GOOGLE_DRIVE_FOLDER_ID")
+
+# Drive OAuth must exist
+if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REFRESH_TOKEN:
+    raise RuntimeError("Missing GOOGLE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN for Drive OAuth")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 
-# In-memory sessions (MVP). Render restart/redeploy clears it.
+# In-memory sessions (MVP). With >1 gunicorn worker, sessions will split. Use -w 1.
 SESSIONS: Dict[int, Dict[str, Any]] = {}
 _sheets_service = None
 _drive_service = None
 
 
 # =========================
-# TEXT / URL
+# TEXT / URL / MENU
 # =========================
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
-
 MENU_TRIGGERS = {
     "hi", "hello", "hey",
     "привет", "здравствуй", "здравствуйте",
@@ -69,9 +76,7 @@ def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def normalize_text_command(text: str) -> str:
-    """
-    Makes '/ new' behave like '/new'. Leaves normal text mostly intact.
-    """
+    """Makes '/ new' behave like '/new'."""
     if not text:
         return ""
     t = text.strip()
@@ -143,31 +148,40 @@ def clear_session(chat_id: int):
 
 
 # =========================
-# Google credentials/services
+# Google: Sheets via Service Account
 # =========================
-def get_credentials():
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    return Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-
 def get_sheets_service():
     global _sheets_service
     if _sheets_service:
         return _sheets_service
-    creds = get_credentials()
+
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = SACredentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return _sheets_service
 
+
+# =========================
+# Google: Drive via OAuth (YOUR account)
+# =========================
 def get_drive_service():
     global _drive_service
     if _drive_service:
         return _drive_service
-    creds = get_credentials()
+
+    creds = UserCredentials(
+        token=None,
+        refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    creds.refresh(GoogleRequest())
+
     _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     return _drive_service
 
@@ -176,9 +190,7 @@ def get_drive_service():
 # ID generation (on Approve)
 # =========================
 def next_daily_id(prefix: str = "FB") -> str:
-    """
-    FB-YYYYMMDD-### increments by day (UTC), read from Sheet1 column A.
-    """
+    """FB-YYYYMMDD-### increments by day (UTC) using Sheet1 column A."""
     service = get_sheets_service()
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     base = f"{prefix}-{today}-"
@@ -198,7 +210,6 @@ def next_daily_id(prefix: str = "FB") -> str:
             tail = v.replace(base, "")
             if tail.isdigit():
                 max_n = max(max_n, int(tail))
-
     return f"{base}{max_n + 1:03d}"
 
 
@@ -214,13 +225,13 @@ def get_telegram_file_path(file_id: str) -> str:
 def download_telegram_file_bytes(file_id: str) -> bytes:
     file_path = get_telegram_file_path(file_id)
     file_url = f"{TELEGRAM_FILE_API}/{file_path}"
-    r = requests.get(file_url, timeout=60)
+    r = requests.get(file_url, timeout=120)
     r.raise_for_status()
     return r.content
 
 
 # =========================
-# Drive upload
+# Drive upload helpers
 # =========================
 def create_drive_folder(name: str, parent_id: str) -> str:
     service = get_drive_service()
@@ -232,7 +243,7 @@ def create_drive_folder(name: str, parent_id: str) -> str:
     folder = service.files().create(body=metadata, fields="id").execute()
     return folder["id"]
 
-def upload_bytes_to_drive(file_bytes: bytes, filename: str, folder_id: str, mime_type: str = "application/octet-stream") -> str:
+def upload_bytes_to_drive(file_bytes: bytes, filename: str, folder_id: str, mime_type: str) -> str:
     service = get_drive_service()
     file_metadata = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
@@ -241,7 +252,7 @@ def upload_bytes_to_drive(file_bytes: bytes, filename: str, folder_id: str, mime
 
 
 # =========================
-# Draft generator (placeholder)
+# Draft generator (placeholder, but uses inputs)
 # =========================
 def build_draft_text(items: List[Dict[str, Any]]) -> str:
     notes: List[str] = []
@@ -308,7 +319,9 @@ def build_draft_text(items: List[Dict[str, Any]]) -> str:
 
 
 # =========================
-# Sheet write
+# Sheets write (Approved row)
+# Columns A:G:
+# ID | Status | Created_UTC | Materials_Count | Post_Text | Published_URL | Media_Links
 # =========================
 def append_approved_row(final_id: str, materials_count: int, post_text: str, media_links: List[str]):
     service = get_sheets_service()
@@ -331,6 +344,7 @@ def append_approved_row(final_id: str, materials_count: int, post_text: str, med
 def health():
     return {"status": "running"}
 
+
 @app.post("/webhook")
 def webhook():
     # Secret gate
@@ -342,7 +356,7 @@ def webhook():
     data = request.get_json(silent=True) or {}
 
     # -------------------------
-    # Callbacks (Approve/Edit/Rewrite/Reject)
+    # Callback buttons
     # -------------------------
     if "callback_query" in data:
         cq = data["callback_query"]
@@ -359,44 +373,59 @@ def webhook():
         last = sess.get("last_draft")
 
         if not last:
-            send_message(chat_id, "No active draft. Generate first (✍️ Generate).")
+            send_message(chat_id, "No active draft. Generate first (✍️ Generate).", reply_markup=start_keyboard())
             return {"ok": True}
 
         if action == "approve":
             try:
                 final_id = next_daily_id()
 
-                # Create folder for this approved post
+                # Create Drive folder for this approved post
                 folder_id = create_drive_folder(final_id, GOOGLE_DRIVE_FOLDER_ID)
 
-                # Upload media from session
+                # Upload all media from session
                 media_links: List[str] = []
                 media_idx = 0
 
                 for it in sess["items"]:
                     t = it.get("type")
+
                     if t == "photo":
                         media_idx += 1
                         file_bytes = download_telegram_file_bytes(it["file_id"])
-                        link = upload_bytes_to_drive(file_bytes, f"photo_{media_idx}.jpg", folder_id, mime_type="image/jpeg")
+                        link = upload_bytes_to_drive(
+                            file_bytes=file_bytes,
+                            filename=f"photo_{media_idx}.jpg",
+                            folder_id=folder_id,
+                            mime_type="image/jpeg",
+                        )
                         media_links.append(f"PHOTO {media_idx}: {link}")
 
                     elif t == "video":
                         media_idx += 1
                         file_bytes = download_telegram_file_bytes(it["file_id"])
-                        link = upload_bytes_to_drive(file_bytes, f"video_{media_idx}.mp4", folder_id, mime_type="video/mp4")
+                        link = upload_bytes_to_drive(
+                            file_bytes=file_bytes,
+                            filename=f"video_{media_idx}.mp4",
+                            folder_id=folder_id,
+                            mime_type="video/mp4",
+                        )
                         media_links.append(f"VIDEO {media_idx}: {link}")
 
                     elif t == "document":
                         media_idx += 1
                         file_bytes = download_telegram_file_bytes(it["file_id"])
                         filename = it.get("filename") or f"file_{media_idx}"
-                        # Keep name safe-ish
                         filename = filename.replace("/", "_").replace("\\", "_")
-                        link = upload_bytes_to_drive(file_bytes, filename, folder_id)
+                        link = upload_bytes_to_drive(
+                            file_bytes=file_bytes,
+                            filename=filename,
+                            folder_id=folder_id,
+                            mime_type="application/octet-stream",
+                        )
                         media_links.append(f"FILE {media_idx}: {link}")
 
-                # Write to sheet
+                # Write row to Google Sheet
                 append_approved_row(
                     final_id=final_id,
                     materials_count=len(sess["items"]),
@@ -409,28 +438,28 @@ def webhook():
                 send_message(chat_id, "Session auto-closed 🔚\nStart a new one with 🆕 New Draft.", reply_markup=start_keyboard())
 
             except Exception as e:
-                send_message(chat_id, f"Approve failed:\n{e}")
+                send_message(chat_id, f"Approve failed:\n{e}", reply_markup=start_keyboard())
 
             return {"ok": True}
 
         if action == "edit":
-            send_message(chat_id, f"Send edits in one message:\n/edit {last['id']} <your changes>")
+            send_message(chat_id, f"Send edits in one message:\n/edit DRAFT <your changes>", reply_markup=start_keyboard())
             return {"ok": True}
 
         if action == "rewrite":
             last["text"] = build_draft_text(sess["items"])
-            send_message(chat_id, f"Rewritten ♻ Draft\n\n{last['text']}", reply_markup=draft_keyboard(last["id"]))
+            send_message(chat_id, f"Rewritten ♻ Draft\n\n{last['text']}", reply_markup=draft_keyboard("DRAFT"))
             return {"ok": True}
 
         if action == "reject":
             sess["last_draft"] = None
-            send_message(chat_id, "Rejected ❌ Draft removed.\nMaterials are still in session. You can Generate again or End Session.")
+            send_message(chat_id, "Rejected ❌ Draft removed.\nMaterials still in session. Generate again or End Session.", reply_markup=start_keyboard())
             return {"ok": True}
 
         return {"ok": True}
 
     # -------------------------
-    # Messages
+    # Normal messages
     # -------------------------
     msg = data.get("message")
     if not msg:
@@ -438,16 +467,16 @@ def webhook():
 
     chat_id = msg["chat"]["id"]
 
-    # Menu trigger by plain greeting
-    raw_text = (msg.get("text") or "").strip().lower()
-    if raw_text in MENU_TRIGGERS:
+    # Greeting opens menu
+    raw_text_lower = (msg.get("text") or "").strip().lower()
+    if raw_text_lower in MENU_TRIGGERS:
         send_message(chat_id, "Hi 👋 FruitsBurg Bot is live 🚀\n\nChoose an action:", reply_markup=start_keyboard())
         return {"ok": True}
 
-    # Command normalization
+    # Normalize commands
     text = normalize_text_command(msg.get("text", ""))
 
-    # Menu buttons (come as plain text)
+    # Menu buttons
     if text == "🆕 New Draft":
         clear_session(chat_id)
         send_message(chat_id, "Hi 👋 New draft session started ✅\nSend materials, then ✍️ Generate.", reply_markup=start_keyboard())
@@ -464,9 +493,8 @@ def webhook():
             send_message(chat_id, "No materials yet. Send text/photo/video/file/link first.", reply_markup=start_keyboard())
             return {"ok": True}
         draft_text = build_draft_text(sess["items"])
-        # draft id is internal only; final id is created on Approve
         sess["last_draft"] = {"id": "DRAFT", "text": draft_text}
-        send_message(chat_id, f"{draft_text}", reply_markup=draft_keyboard("DRAFT"))
+        send_message(chat_id, draft_text, reply_markup=draft_keyboard("DRAFT"))
         return {"ok": True}
 
     if text == "🔚 End Session":
@@ -483,8 +511,8 @@ def webhook():
             "3) ✍️ Generate\n"
             "4) ✅ Approve (uploads media to Drive + saves row to Sheet)\n"
             "5) Session auto-closes (or 🔚 End Session)\n\n"
-            "You can also type: hi / привет / menu to open this menu.",
-            reply_markup=start_keyboard()
+            "Tip: type hi / привет / menu to open this menu.",
+            reply_markup=start_keyboard(),
         )
         return {"ok": True}
 
@@ -510,13 +538,13 @@ def webhook():
             return {"ok": True}
         draft_text = build_draft_text(sess["items"])
         sess["last_draft"] = {"id": "DRAFT", "text": draft_text}
-        send_message(chat_id, f"{draft_text}", reply_markup=draft_keyboard("DRAFT"))
+        send_message(chat_id, draft_text, reply_markup=draft_keyboard("DRAFT"))
         return {"ok": True}
 
     if text.startswith("/edit"):
         parts = (msg.get("text") or "").split(" ", 2)
         if len(parts) < 3:
-            send_message(chat_id, "Use: /edit <draft_id> <your changes>", reply_markup=start_keyboard())
+            send_message(chat_id, "Use: /edit DRAFT <your changes>", reply_markup=start_keyboard())
             return {"ok": True}
         _, _draft_id, changes = parts
         sess = get_session(chat_id)
@@ -541,7 +569,7 @@ def webhook():
         if caption:
             item["caption"] = caption
         sess["items"].append(item)
-        send_message(chat_id, f"Photo received. Session materials: {len(sess['items'])}. Send more or Generate.", reply_markup=start_keyboard())
+        send_message(chat_id, f"Photo received. Session materials: {len(sess['items'])}.", reply_markup=start_keyboard())
         return {"ok": True}
 
     # Video (+caption)
@@ -552,7 +580,7 @@ def webhook():
         if caption:
             item["caption"] = caption
         sess["items"].append(item)
-        send_message(chat_id, f"Video received. Session materials: {len(sess['items'])}. Send more or Generate.", reply_markup=start_keyboard())
+        send_message(chat_id, f"Video received. Session materials: {len(sess['items'])}.", reply_markup=start_keyboard())
         return {"ok": True}
 
     # Document (+caption)
@@ -564,7 +592,7 @@ def webhook():
         if caption:
             item["caption"] = caption
         sess["items"].append(item)
-        send_message(chat_id, f"File received ({filename}). Session materials: {len(sess['items'])}. Send more or Generate.", reply_markup=start_keyboard())
+        send_message(chat_id, f"File received ({filename}). Session materials: {len(sess['items'])}.", reply_markup=start_keyboard())
         return {"ok": True}
 
     # Text or link
@@ -576,7 +604,7 @@ def webhook():
             send_message(chat_id, f"Link received. Session materials: {len(sess['items'])}.\n{url}", reply_markup=start_keyboard())
             return {"ok": True}
         sess["items"].append({"type": "text", "text": t})
-        send_message(chat_id, f"Note received. Session materials: {len(sess['items'])}. Send more or Generate.", reply_markup=start_keyboard())
+        send_message(chat_id, f"Note received. Session materials: {len(sess['items'])}.", reply_markup=start_keyboard())
         return {"ok": True}
 
     return {"ok": True}
