@@ -4,5 +4,5 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT main:app
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT main:app
     autoDeploy: true
